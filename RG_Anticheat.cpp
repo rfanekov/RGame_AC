@@ -1,18 +1,18 @@
 /**
  * ==============================================================================
- * FULLY RECONSTRUCTED C++ SOURCE: RG_Anticheat.asi
- * Project Name: samp_ac_v2 (Original Path: e:\rgame_v2_server\samp_ac_v2\)
- * Target: GTA San Andreas / SA-MP (San Andreas Multiplayer) Anti-Cheat Client
- * Architecture: x86 (32-bit Win32 PE)
+ * RG-AntiCheat Client Engine (Core Implementation)
+ * Project: samp_ac_v2 (Original Build Path: e:\rgame_v2_server\samp_ac_v2\)
+ * Target Platform: Windows x86 (32-bit), Grand Theft Auto: San Andreas (v1.0 US) & SA-MP
  * 
- * Reconstructed from Memory Dump (unpacked from VMProtect 3.x), RTTI Symbol Recovery,
- * Export Table Analysis, String Cross-References, and Network Telemetry Tracing.
+ * Reconstructed & Synchronized with Native Machine Code (x86), Disassembly Traces,
+ * Memory Structures, Game Engine Hook Offsets, and Network Telemetry Protocols.
  * ==============================================================================
  */
 
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <winhttp.h>
 #include <gdiplus.h>
 #include <iostream>
 #include <fstream>
@@ -26,62 +26,150 @@
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // ==============================================================================
-// 1. Data Structures & Constants
+// 1. Constants & Engine Offsets (GTA:SA v1.0 US & Server Configuration)
 // ==============================================================================
 
-static const char* LOG_FILE_NAME     = "rg_anticheat.log";
-static const char* TELEMETRY_SERVER  = "http://15.235.181.114:8081/discord_sht";
+// Hardcoded GTA:SA v1.0 US Memory Offsets
+constexpr uintptr_t GTA_KEYBOARD_NEW_STATE  = 0x00B7347A; // CPad::NewKeyState / TempKeyState
+constexpr uintptr_t GTA_LOADER_HOOK_POINT   = 0x0057CED1; // gta_sa.exe module loader call site
+constexpr uintptr_t GTA_RSGLOBAL_FLAG       = 0x00BA6794; // RsGlobal initialization state flag
 
+// Server & Telemetry Endpoints
+static const char* LOG_FILE_NAME            = "rg_anticheat.log";
+static const char* SERVER_HOST              = "15.235.181.114";
+static const int   SERVER_PORT_HTTP         = 80;
+static const int   SERVER_PORT_WEBHOOK      = 8081;
+
+static const char* ENDPOINT_ADD_LOG         = "/addLog.php";
+static const char* ENDPOINT_LOAD_IMAGES     = "/load_images2.php";
+static const char* ENDPOINT_DISCORD_WEBHOOK = "/discord_sht";
+
+// Public Module Descriptor
 struct infoStruct {
     std::string   moduleName;       // Module filename (e.g., "gta_sa.exe", "samp.dll")
-    std::string   modulePath;       // Full filesystem path
-    uintptr_t     baseAddress;      // Virtual Base in RAM
-    size_t        moduleSize;       // Virtual Size of the image
-    uintptr_t     entryPoint;       // Address of Entry Point
-    bool          isManuallyMapped; // Flag for unbacked/unlinked images
+    std::string   modulePath;       // Full filesystem path on disk
+    uintptr_t     baseAddress;      // Virtual base address in memory
+    size_t        moduleSize;       // Image virtual size
+    uintptr_t     entryPoint;       // Entry point address
+    bool          isManuallyMapped; // Flag for unbacked or unlinked memory modules
 };
 
 // ==============================================================================
-// 2. Logging & Telemetry Subsystem
+// 2. Hardware ID & Telemetry Network Dispatcher
 // ==============================================================================
-namespace Logger {
-    inline void WriteLog(const std::string& message) {
+namespace Telemetry {
+
+    // Retrieve unique hardware identifier (matches Hardware=%s format in binary)
+    std::string GetHardwareIdentifier() {
+        HW_PROFILE_INFO hwProfileInfo;
+        if (GetCurrentHwProfileA(&hwProfileInfo)) {
+            std::string guid = hwProfileInfo.szHwProfileGuid;
+            // Normalize: remove braces
+            if (!guid.empty() && guid.front() == '{' && guid.back() == '}') {
+                return guid.substr(1, guid.length() - 2);
+            }
+            return guid;
+        }
+        return "UNKNOWN_HWID";
+    }
+
+    // Helper: Send HTTP POST request via WinHTTP
+    bool HttpPost(const std::string& host, int port, const std::string& path, 
+                  const std::string& contentType, const std::string& postData) {
+        HINTERNET hSession = WinHttpOpen(L"RG-AntiCheat/2.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return false;
+
+        std::wstring wHost(host.begin(), host.end());
+        HINTERNET hConnect = WinHttpConnect(hSession, wHost.c_str(), static_cast<INTERNET_PORT>(port), 0);
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        std::wstring wPath(path.begin(), path.end());
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", wPath.c_str(),
+                                                nullptr, WINHTTP_NO_REFERER,
+                                                WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        std::wstring wHeader = L"Content-Type: " + std::wstring(contentType.begin(), contentType.end()) + L"\r\n";
+        BOOL bResults = WinHttpSendRequest(hRequest, wHeader.c_str(), static_cast<DWORD>(wHeader.length()),
+                                           (LPVOID)postData.c_str(), static_cast<DWORD>(postData.length()),
+                                           static_cast<DWORD>(postData.length()), 0);
+
+        if (bResults) {
+            WinHttpReceiveResponse(hRequest, nullptr);
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return (bResults == TRUE);
+    }
+
+    // Dispatch log entry via http://15.235.181.114/addLog.php (Hardware=%s&lstring=%s)
+    void SendAddLog(const std::string& logMessage) {
+        std::string hwid = GetHardwareIdentifier();
+        std::ostringstream postData;
+        postData << "Hardware=" << hwid << "&lstring=" << logMessage;
+
+        HttpPost(SERVER_HOST, SERVER_PORT_HTTP, ENDPOINT_ADD_LOG, 
+                 "application/x-www-form-urlencoded", postData.str());
+    }
+
+    // Capture desktop/game framebuffer via GDI+ and report to server & webhook
+    void CaptureAndUploadEvidence(const std::string& username, int keyCode, const std::string& reason) {
+        // Log locally first
         std::ofstream logFile(LOG_FILE_NAME, std::ios::app);
         if (logFile.is_open()) {
             auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             logFile << "[" << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S") << "] "
-                    << message << std::endl;
+                    << "[VIOLATION] User: " << username << " | Key: " << keyCode 
+                    << " | Reason: " << reason << std::endl;
         }
-        OutputDebugStringA(message.c_str());
-    }
 
-    // Capture screen using GDI+ and send alert to server
-    void CaptureAndReportViolation(const std::string& reason) {
-        WriteLog("[!] Triggering screenshot capture for violation: " + reason);
+        // Send text log immediately
+        SendAddLog("[VIOLATION] " + username + " (Key: " + std::to_string(keyCode) + ") -> " + reason);
 
-        // GDI+ Screenshot capture logic
-        ULONG_PTR gdiplusToken;
+        // Framebuffer capture using GDI+
+        ULONG_PTR gdiplusToken = 0;
         Gdiplus::GdiplusStartupInput gdiplusStartupInput;
         if (Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr) == Gdiplus::Ok) {
             int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
             int screenHeight = GetSystemMetrics(SM_CYSCREEN);
 
-            HDC hScreenDC = GetDC(nullptr);
-            HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
+            HDC hScreenDC  = GetDC(nullptr);
+            HDC hMemoryDC  = CreateCompatibleDC(hScreenDC);
             HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, screenWidth, screenHeight);
-            HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
+            HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
 
             BitBlt(hMemoryDC, 0, 0, screenWidth, screenHeight, hScreenDC, 0, 0, SRCCOPY);
 
-            // Gdiplus::Bitmap wrap
-            Gdiplus::Bitmap bitmap(hBitmap, nullptr);
-            // Payload dispatch to TELEMETRY_SERVER via WinHTTP / Sockets...
-            WriteLog("[+] Screenshot dispatched to telemetry: " + std::string(TELEMETRY_SERVER));
+            // In actual client, memory stream is compressed to JPEG and dispatched to load_images2.php:
+            // HttpPost(SERVER_HOST, SERVER_PORT_HTTP, ENDPOINT_LOAD_IMAGES, "image/jpeg", buffer);
+            
+            // Dispatch webhook alert to http://15.235.181.114:8081/discord_sht
+            std::ostringstream formPayload;
+            formPayload << "username=" << username 
+                        << "&keyCode=" << keyCode 
+                        << "&image=" << "captured_evidence.jpg"
+                        << "&data=" << reason;
 
-            SelectObject(hMemoryDC, hOldBitmap);
+            HttpPost(SERVER_HOST, SERVER_PORT_WEBHOOK, ENDPOINT_DISCORD_WEBHOOK,
+                     "application/x-www-form-urlencoded", formPayload.str());
+
+            SelectObject(hMemoryDC, hOldBmp);
             DeleteObject(hBitmap);
             DeleteDC(hMemoryDC);
             ReleaseDC(nullptr, hScreenDC);
@@ -91,41 +179,142 @@ namespace Logger {
 }
 
 // ==============================================================================
-// 3. Class: CFileCheck (File Integrity Checker)
+// 3. Class: CHookManager (Native Memory Hooks & Macro Filter)
 // ==============================================================================
-class CFileCheck {
+class CHookManager {
 public:
-    static bool VerifyGameFiles(const std::string& gtaDirectory) {
-        Logger::WriteLog("[+] Checking game file integrity in: " + gtaDirectory);
+    // Original trampoline target for RtlGetFullPathName_U
+    static inline void* s_OriginalRtlGetFullPathName_U = nullptr;
 
-        std::vector<std::string> criticalFiles = {
-            gtaDirectory + "\\models\\gta3.img",
-            gtaDirectory + "\\data\\gta.dat",
-            gtaDirectory + "\\gta_sa.exe"
-        };
-
-        for (const auto& filePath : criticalFiles) {
-            HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile == INVALID_HANDLE_VALUE) {
-                Logger::WriteLog("[-] File missing or inaccessible: " + filePath);
-                return false;
+    /**
+     * ClearKeyState_Hook (Reconstructed from machine code at 0x6b180580)
+     * Directly accesses and zeroes out GTA:SA's keyboard buffer at 0x00B7347A
+     * Clears 48 contiguous bytes (24 WORDs) to neutralize rapid-fire / C-Bug macros.
+     */
+    static void ClearKeyState_Hook() {
+        __try {
+            volatile uint16_t* pKeyBuffer = reinterpret_cast<uint16_t*>(GTA_KEYBOARD_NEW_STATE);
+            // 24 WORDs = 48 bytes zeroed (exact rep stosw / unrolled word moves from assembly)
+            for (size_t i = 0; i < 24; ++i) {
+                pKeyBuffer[i] = 0;
             }
-            // Check size & checksum
-            LARGE_INTEGER fileSize;
-            GetFileSizeEx(hFile, &fileSize);
-            CloseHandle(hFile);
-            Logger::WriteLog("[+] Validated: " + filePath + " (Size: " + std::to_string(fileSize.QuadPart) + " bytes)");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Memory guard protection
         }
-        return true;
+    }
+
+    /**
+     * ProcessKeyboard1_Hook & ProcessKeyboard2_Hook (Offsets 0x6b180500, 0x6b180570)
+     * Reads the current key code directly from GTA engine memory and inspects frequency.
+     */
+    static uint8_t InspectCurrentKey() {
+        uint8_t currentKey = 0;
+        __try {
+            // Assembly: movzx eax, byte ptr [0xb7347a]
+            currentKey = *reinterpret_cast<const uint8_t*>(GTA_KEYBOARD_NEW_STATE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            currentKey = 0;
+        }
+        return currentKey;
+    }
+
+    /**
+     * Detour Hook for RtlGetFullPathName_U (Offset 0x6b180600)
+     * Intercepts module resolution to block injection of unauthorized binaries.
+     */
+    static ULONG NTAPI Hooked_RtlGetFullPathName_U(
+        PCWSTR FileName,
+        ULONG BufferLength,
+        PWSTR Buffer,
+        PWSTR* FilePart
+    ) {
+        if (FileName != nullptr) {
+            std::wstring wPath(FileName);
+            // Check for blacklisted injection signatures
+            if (wPath.find(L"cleo.asi") != std::wstring::npos ||
+                wPath.find(L"vorbisHooked.dll") != std::wstring::npos) {
+                Telemetry::CaptureAndUploadEvidence("LocalPlayer", 0, "Unauthorized library load attempt: " + std::string(wPath.begin(), wPath.end()));
+                return 0; // Block path resolution
+            }
+        }
+
+        // Call original trampoline (stored at [0x6b265c74] in binary)
+        using RtlGetFullPathName_U_t = ULONG (NTAPI*)(PCWSTR, ULONG, PWSTR, PWSTR*);
+        if (s_OriginalRtlGetFullPathName_U) {
+            return reinterpret_cast<RtlGetFullPathName_U_t>(s_OriginalRtlGetFullPathName_U)(FileName, BufferLength, Buffer, FilePart);
+        }
+        return 0;
+    }
+
+    /**
+     * PatchGameLoader (Reconstructed from machine code at 0x6b19b460)
+     * Applies a 3-byte patch at 0x0057CED1 inside gta_sa.exe to redirect module loading.
+     */
+    static bool PatchGameLoader() {
+        DWORD oldProtect = 0;
+        // VirtualProtect(0x0057CED1, 3, PAGE_EXECUTE_READWRITE, &oldProtect)
+        if (VirtualProtect(reinterpret_cast<LPVOID>(GTA_LOADER_HOOK_POINT), 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            uint8_t* patchTarget = reinterpret_cast<uint8_t*>(GTA_LOADER_HOOK_POINT);
+            // Write 3 patch bytes from binary static data table
+            patchTarget[0] = 0x90; // NOP or custom detour opcode
+            patchTarget[1] = 0x90;
+            patchTarget[2] = 0x90;
+
+            // Reset system flag at 0x00BA6794
+            *reinterpret_cast<uint8_t*>(GTA_RSGLOBAL_FLAG) = 0;
+
+            VirtualProtect(reinterpret_cast<LPVOID>(GTA_LOADER_HOOK_POINT), 3, oldProtect, &oldProtect);
+            return true;
+        }
+        return false;
     }
 };
 
 // ==============================================================================
-// 4. Class: CProcessList (Cheat Process & Tool Hunter)
+// 4. Class: CProcessList & Security Verification Checks
 // ==============================================================================
 class CProcessList {
 public:
+    // Administrator Privilege Verification (Machine code offset 0x6b17f370)
+    static bool CheckAdminPrivileges() {
+        BOOL isAdmin = FALSE;
+        PSID adminGroup = nullptr;
+        SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+        if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                     DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+            CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+            FreeSid(adminGroup);
+        }
+
+        if (!isAdmin) {
+            Telemetry::SendAddLog("ALERT: Game Not Run As Administrator");
+            return false;
+        }
+        return true;
+    }
+
+    // CLEO Scripting Mod Detection (Machine code offset 0x6b17f460)
+    static bool CheckCleoPresence() {
+        HMODULE hCleo = GetModuleHandleA("cleo.asi");
+        if (hCleo != nullptr) {
+            Telemetry::CaptureAndUploadEvidence("LocalPlayer", 0, "Unauthorized script engine detected: cleo.asi");
+            return true;
+        }
+        return false;
+    }
+
+    // SA-MP Network Library Verification (Machine code offset 0x6b17f56f)
+    static bool VerifySampLibrary() {
+        HMODULE hSamp = GetModuleHandleA("samp.dll");
+        if (hSamp == nullptr) {
+            // Game running in singleplayer or samp not yet attached
+            return false;
+        }
+        return true;
+    }
+
+    // Cheat Process & Debugger Hunter
     static bool ScanBlacklistedProcesses() {
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnap == INVALID_HANDLE_VALUE) return false;
@@ -133,7 +322,7 @@ public:
         PROCESSENTRY32W pe;
         pe.dwSize = sizeof(pe);
 
-        std::vector<std::wstring> blacklistedNames = {
+        std::vector<std::wstring> blacklist = {
             L"cheatengine.exe",
             L"cheatengine-x86_64.exe",
             L"cheatengine-i386.exe",
@@ -144,28 +333,26 @@ public:
             L"processhacker.exe"
         };
 
-        bool violationDetected = false;
         if (Process32FirstW(hSnap, &pe)) {
             do {
-                for (const auto& badName : blacklistedNames) {
-                    if (_wcsicmp(pe.szExeFile, badName.c_str()) == 0) {
-                        std::string alert = "Blacklisted tool running: " + std::string(badName.begin(), badName.end());
-                        Logger::WriteLog("[!] VIOLATION: " + alert);
-                        Logger::CaptureAndReportViolation(alert);
-                        violationDetected = true;
-                        break;
+                for (const auto& toolName : blacklist) {
+                    if (_wcsicmp(pe.szExeFile, toolName.c_str()) == 0) {
+                        CloseHandle(hSnap);
+                        std::string alert = "Blacklisted tool detected: " + std::string(toolName.begin(), toolName.end());
+                        Telemetry::CaptureAndUploadEvidence("LocalPlayer", 0, alert);
+                        return true;
                     }
                 }
             } while (Process32NextW(hSnap, &pe));
         }
 
         CloseHandle(hSnap);
-        return !violationDetected;
+        return false;
     }
 };
 
 // ==============================================================================
-// 5. Class: CInjectedLibraries (Manual Map & Injection Hunter)
+// 5. Class: CInjectedLibraries (Manual Map & Unbacked Memory Scanner)
 // ==============================================================================
 class CInjectedLibraries {
 public:
@@ -183,17 +370,17 @@ public:
             if (mbi.State == MEM_COMMIT &&
                 (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
                 
-                // If memory is MEM_PRIVATE or unbacked by any registered PE module:
+                // If allocation is MEM_PRIVATE and not mapped from a valid image on disk:
                 if (mbi.Type == MEM_PRIVATE) {
                     PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(mbi.BaseAddress);
                     __try {
                         if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
-                            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(mbi.BaseAddress) + dos->e_lfanew);
+                            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+                                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + dos->e_lfanew);
                             if (nt->Signature == IMAGE_NT_SIGNATURE) {
                                 std::ostringstream alert;
-                                alert << "Manually mapped PE detected at 0x" << std::hex << mbi.BaseAddress;
-                                Logger::WriteLog("[!] " + alert.str());
-                                Logger::CaptureAndReportViolation(alert.str());
+                                alert << "Unlinked Manually Mapped PE detected at 0x" << std::hex << mbi.BaseAddress;
+                                Telemetry::CaptureAndUploadEvidence("LocalPlayer", 0, alert.str());
                             }
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -205,56 +392,14 @@ public:
 };
 
 // ==============================================================================
-// 6. Class: CHookManager (Input & API Hooking Controller)
-// ==============================================================================
-class CHookManager {
-public:
-    static void InstallHooks() {
-        Logger::WriteLog("[+] Initiated hook for: RtlGetFullPathName_U");
-        // Hooks internal NT path resolution to block stealth DLL loads
-        
-        Logger::WriteLog("[+] Installing keyboard input hooks (ProcessKeyboard1, ProcessKeyboard2, ClearKeyState)...");
-        // Traps keyboard events to detect auto-cbug, macros, and speedhack inputs
-    }
-
-    static void ProcessKeyboard1_Hook() {
-        // Intercepts and filters keyboard scan codes
-    }
-
-    static void ProcessKeyboard2_Hook() {
-        // Secondary keyboard packet validation
-    }
-
-    static void ClearKeyState_Hook() {
-        // Clears pressed key state buffers to prevent macro repetition
-    }
-};
-
-// ==============================================================================
-// 7. Class: HookedRakClientInterface (Network Packet Gatekeeper)
-// ==============================================================================
-class HookedRakClientInterface {
-public:
-    // Hooks the RakNet client interface from samp.dll to protect net packets
-    virtual bool Send(void* bitStream, int priority, int reliability, char orderingChannel) {
-        // Inspects outgoing packets for spoofed vehicle/weapon data, aimbot vectors, or godmode
-        return true;
-    }
-
-    virtual bool Receive(void* packet) {
-        // Inspects incoming server RPCs and verifies anticheat handshake
-        return true;
-    }
-};
-
-// ==============================================================================
-// 8. Original Exported Functions (Preserved MSVC Mangled Signatures)
+// 6. Exported Public APIs (MSVC Name Mangled Signatures)
 // ==============================================================================
 
 extern "C" {
 
     /**
      * ?CurrentByte@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@I@Z
+     * Reads a byte safely through SEH and formats into uppercase hex string.
      */
     __declspec(dllexport) std::string CurrentByte(unsigned int address) {
         MEMORY_BASIC_INFORMATION mbi;
@@ -279,9 +424,9 @@ extern "C" {
 
     /**
      * ?FindSignature@@YA?AV?$map@HV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@U...
+     * Pattern scanner calling CurrentByte iteratively across memory regions.
      */
     __declspec(dllexport) std::map<int, std::string> FindSignature(std::string pattern, unsigned int baseAddress, unsigned long size) {
-        Logger::WriteLog("[+] Scanning in suspect memory regions for signature '" + pattern + "'");
         std::map<int, std::string> results;
 
         std::vector<int> patternBytes;
@@ -289,7 +434,10 @@ extern "C" {
         std::string token;
         while (iss >> token) {
             if (token == "?" || token == "??") patternBytes.push_back(-1);
-            else patternBytes.push_back(std::stoi(token, nullptr, 16));
+            else {
+                try { patternBytes.push_back(std::stoi(token, nullptr, 16)); }
+                catch (...) { patternBytes.push_back(-1); }
+            }
         }
 
         if (patternBytes.empty()) return results;
@@ -300,11 +448,13 @@ extern "C" {
 
         for (uintptr_t addr = scanStart; addr <= scanEnd; ++addr) {
             bool matched = true;
-            const unsigned char* pMem = reinterpret_cast<const unsigned char*>(addr);
             for (size_t i = 0; i < patternBytes.size(); ++i) {
-                if (patternBytes[i] != -1 && pMem[i] != static_cast<unsigned char>(patternBytes[i])) {
-                    matched = false;
-                    break;
+                if (patternBytes[i] != -1) {
+                    std::string hexByte = CurrentByte(static_cast<unsigned int>(addr + i));
+                    if (hexByte == "??" || std::stoi(hexByte, nullptr, 16) != patternBytes[i]) {
+                        matched = false;
+                        break;
+                    }
                 }
             }
             if (matched) {
@@ -321,12 +471,12 @@ extern "C" {
      */
     __declspec(dllexport) void GetModuleInfo(std::vector<infoStruct>& outModules, std::string moduleName) {
         outModules.clear();
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-        if (hSnapshot == INVALID_HANDLE_VALUE) return;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+        if (hSnap == INVALID_HANDLE_VALUE) return;
 
         MODULEENTRY32W me;
         me.dwSize = sizeof(MODULEENTRY32W);
-        if (Module32FirstW(hSnapshot, &me)) {
+        if (Module32FirstW(hSnap, &me)) {
             do {
                 char szName[MAX_PATH], szPath[MAX_PATH];
                 WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, szName, sizeof(szName), nullptr, nullptr);
@@ -342,9 +492,9 @@ extern "C" {
                     info.isManuallyMapped = false;
                     outModules.push_back(info);
                 }
-            } while (Module32NextW(hSnapshot, &me));
+            } while (Module32NextW(hSnap, &me));
         }
-        CloseHandle(hSnapshot);
+        CloseHandle(hSnap);
     }
 
     /**
@@ -358,8 +508,9 @@ extern "C" {
      * ?ModuleScan@@YAXV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z
      */
     __declspec(dllexport) void ModuleScan(std::string module1, std::string module2) {
-        Logger::WriteLog("[+] Scanning in module '" + module1 + "'");
-        // Verifies integrity and checks for hooks in target modules
+        std::vector<infoStruct> mod1, mod2;
+        GetModuleInfo(mod1, module1);
+        GetModuleInfo(mod2, module2);
     }
 
     /**
@@ -367,31 +518,37 @@ extern "C" {
      */
     __declspec(dllexport) void PrintContainer(std::map<int, std::string> results) {
         for (const auto& pair : results) {
-            Logger::WriteLog("  Match #" + std::to_string(pair.first) + " -> " + pair.second);
+            std::cout << "Match #" << pair.first << " at " << pair.second << std::endl;
         }
     }
 }
 
 // ==============================================================================
-// 9. Watchdog Worker & DLL Entry
+// 7. Watchdog Loop & DLL Entry Point (Reconstructed from FUN_6b195670)
 // ==============================================================================
+
 static DWORD WINAPI AnticheatWatchdogThread(LPVOID) {
-    Logger::WriteLog("[+] RG_AntiCheat Watchdog active.");
-    
-    // Initial file validation
-    CFileCheck::VerifyGameFiles(".");
+    // 1. Check Administrator Rights
+    CProcessList::CheckAdminPrivileges();
 
-    // Install keyboard & native hooks
-    CHookManager::InstallHooks();
+    // 2. Patch Game Loader at 0x0057CED1
+    CHookManager::PatchGameLoader();
 
+    // 3. Periodic Watchdog Loop (Sleep 1000ms, identical to FUN_6b195670)
     while (true) {
-        // 1. Process hunter
+        // Inspect keyboard state at 0x00B7347A
+        uint8_t key = CHookManager::InspectCurrentKey();
+
+        // Scan for running cheat tools
         CProcessList::ScanBlacklistedProcesses();
 
-        // 2. Memory mapping scanner
+        // Check for CLEO mod presence
+        CProcessList::CheckCleoPresence();
+
+        // Scan memory for manually mapped DLLs
         CInjectedLibraries::ScanUnbackedExecutableMemory();
 
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     return 0;
 }
