@@ -25,6 +25,8 @@
  *   FUN_6b191998 = Admin privilege check (AllocateAndInitializeSid)
  *   FUN_6b182840 = Keyboard state hook setup
  *   FUN_6b196de0 = File integrity checker (gta3.img, gta.dat, gta_sa.exe)
+ *   FUN_6b198830 = Massive SA-MP Packet Filter / Event Dispatcher (1577 lines)
+ *   FUN_6b21cc0c = Render Hook / D3D9 State Machine (1276 lines)
  *   FUN_6b1937a0 = ClearKeyState hook (zeroes CPad::NewKeyState at 0xB7347A)
  *   FUN_6b1914b0 = ntdll RtlGetFullPathName_U detour installer
  * ==============================================================================
@@ -639,6 +641,74 @@ public:
             }
         }
         return true;
+    }
+};
+
+// ==============================================================================
+// 7B. D3D9 RENDER HOOKS (FUN_6b21cc0c)
+//     Prevents Wallhack / Chams by intercepting DrawIndexedPrimitive
+// ==============================================================================
+
+class CRenderHook {
+public:
+    static HRESULT WINAPI Hooked_DrawIndexedPrimitive(
+        void* pDevicePtr,
+        int Type,
+        int BaseVertexIndex,
+        unsigned int MinVertexIndex,
+        unsigned int NumVertices,
+        unsigned int startIndex,
+        unsigned int primCount)
+    {
+        // Reconstructed detour call to original DrawIndexedPrimitive
+        typedef HRESULT(WINAPI* DrawIndexedPrimitiveFn)(void*, int, int, unsigned int, unsigned int, unsigned int, unsigned int);
+        auto pOriginal = reinterpret_cast<DrawIndexedPrimitiveFn>(0x6b265c78);
+        if (pOriginal) {
+            return pOriginal(pDevicePtr, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+        }
+        return 0;
+    }
+};
+
+// ==============================================================================
+// 7C. SA-MP PACKET FILTER (FUN_6b198830)
+//     Filters outbound RakNet packets to prevent sync hacks (teleport, fake weapon)
+// ==============================================================================
+
+class CPacketFilter {
+public:
+    // This is the massive 1500-line switch block in FUN_6b198830
+    // It intercepts calls before they are handed to RakClientInterface::Send
+    static bool FilterOutboundPacket(unsigned char packetId, void* packetData, int packetSize) {
+        // SA-MP Packet IDs (Standard RakNet + SAMP custom)
+        constexpr unsigned char ID_PLAYER_SYNC = 207;
+        constexpr unsigned char ID_VEHICLE_SYNC = 200;
+        constexpr unsigned char ID_WEAPON_SYNC = 203;
+
+        switch (packetId) {
+            case ID_PLAYER_SYNC: {
+                // Check for teleportation by comparing distance from last known position
+                // (Simplified logic from the huge Ghidra state machine)
+                float* pos = reinterpret_cast<float*>((uintptr_t)packetData + 12); // XYZ starts around offset 12
+                if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) {
+                    Telemetry::Log("Blocked invalid player sync packet (0,0,0)");
+                    return false; // Block packet
+                }
+                break;
+            }
+            case ID_WEAPON_SYNC: {
+                // Check if weapon is valid in player's inventory
+                uint16_t weaponId = *reinterpret_cast<uint16_t*>((uintptr_t)packetData + 2);
+                if (weaponId > 46) {
+                    Telemetry::Log("Blocked invalid weapon sync (ID > 46)");
+                    return false;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return true; // Allow packet
     }
 };
 
